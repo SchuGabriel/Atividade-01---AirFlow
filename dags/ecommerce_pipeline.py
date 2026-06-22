@@ -3,20 +3,39 @@ from datetime import timedelta
 from airflow.utils.task_group import TaskGroup
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from datetime import datetime
+
 import pendulum
 import requests
 import logging
 
 def on_success_callback(context):
-    logging.info("Task executada com sucesso")
+    task_id = context["task_instance"].task_id
+
+    logging.info(
+        f"Task '{task_id}' executada com sucesso"
+    )
 
 
 def on_retry_callback(context):
-    logging.warning("Task em retry")
+    task_id = context["task_instance"].task_id
+
+    logging.warning(
+        f"Task '{task_id}' entrou em retry"
+    )
 
 
 def on_failure_callback(context):
-    logging.error("Task falhou")
+    task_id = context["task_instance"].task_id
+    dag_id = context["dag"].dag_id
+    execution_date = context["logical_date"]
+
+    mensagem = (
+        f"ALERTA: Falha na DAG '{dag_id}' | "
+        f"Task: '{task_id}' | "
+        f"Execução: {execution_date}"
+    )
+
+    logging.error(mensagem)
 
 
 default_args = {
@@ -114,6 +133,18 @@ def ecommerce_pipeline():
         conn = hook.get_conn()
         cursor = conn.cursor()
 
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS category_metrics (
+                category TEXT,
+                avg_price NUMERIC,
+                min_price NUMERIC,
+                max_price NUMERIC,
+                product_count INT,
+                execution_date DATE,
+                PRIMARY KEY (category, execution_date)
+            )
+        """)
+
         execution_date = datetime.now().date()
 
         for item in metrics:
@@ -147,6 +178,60 @@ def ecommerce_pipeline():
 
         logging.info("Dados salvos no PostgreSQL com sucesso")
 
+    @task
+    def save_history(metrics):
+
+        hook = PostgresHook(
+            postgres_conn_id="postgres_default"
+        )
+
+        conn = hook.get_conn()
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS category_metrics_history (
+                id SERIAL PRIMARY KEY,
+                category TEXT,
+                avg_price NUMERIC,
+                min_price NUMERIC,
+                max_price NUMERIC,
+                product_count INT,
+                execution_date TIMESTAMP
+            )
+        """)
+
+        for item in metrics:
+
+            cursor.execute(
+                """
+                INSERT INTO category_metrics_history (
+                    category,
+                    avg_price,
+                    min_price,
+                    max_price,
+                    product_count,
+                    execution_date
+                )
+                VALUES (%s, %s, %s, %s, %s, NOW())
+                """,
+                (
+                    item["category"],
+                    item["avg_price"],
+                    item["min_price"],
+                    item["max_price"],
+                    item["product_count"],
+                )
+            )
+
+        conn.commit()
+
+        cursor.close()
+        conn.close()
+
+        logging.info(
+            "Histórico salvo com sucesso"
+        )
+
     with TaskGroup(group_id="ingestao"):
         products = fetch_products()
     
@@ -160,7 +245,11 @@ def ecommerce_pipeline():
             category=categories
         )
     
-        clean_metrics = consolidate_metrics(metrics)
-        save_to_postgres(clean_metrics)
+        metrics_consolidated = consolidate_metrics(metrics)
+
+        snapshot = save_to_postgres(metrics_consolidated)
+        history = save_history(metrics_consolidated)
+
+        snapshot >> history
 
 ecommerce_pipeline()
